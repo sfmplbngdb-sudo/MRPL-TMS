@@ -1171,6 +1171,15 @@ const SB = {
     await sb('gc_master', 'PATCH', { cancelled: true }, '?id=eq.'+id);
     return { success: true };
   },
+  // Weight (MT) and Freight Amount are entered per-GC only in the MF Account module
+  async updateGCAmounts(d) {
+    await sb('gc_master', 'PATCH', { weight_mt: parseFloat(d.Weight_MT)||0, freight_amount: parseFloat(d.Freight_Amount)||0 }, '?id=eq.'+d.GC_ID);
+    // Keep trip_dispatch_master.final_mt in sync as the sum of all GC weights for this SO
+    const gcs = await sb('gc_master', 'GET', null, '?so_id=eq.'+d.SO_ID+'&cancelled=eq.false');
+    const totalMT = gcs.reduce((s,g)=>s+(parseFloat(g.weight_mt)||0),0);
+    await sb('trip_dispatch_master', 'PATCH', { final_mt: totalMT }, '?so_id=eq.'+d.SO_ID);
+    return { success: true };
+  },
   // Stamps the MF number onto every active GC belonging to this SO, once the MF is raised
   async stampMFOnGCs(soId, mfNo) {
     await sb('gc_master', 'PATCH', { mf_no: mfNo }, '?so_id=eq.'+soId+'&cancelled=eq.false');
@@ -2578,7 +2587,7 @@ async function renderOperations() {
     <div class="section-card">
       <div class="section-title">
         <span>Operations – Trip Entry</span>
-        <button class="btn btn-outline btn-sm" onclick="loadTripTable(1)">📋 View Trips</button>
+        <button class="btn btn-outline btn-sm" onclick="toggleTripTable()">📋 View Trips</button>
       </div>
 
       <div id="op-info-banner" style="display:none;background:var(--primary-light);border:1px solid #bfdbfe;border-radius:8px;padding:10px 16px;margin-bottom:16px">
@@ -2762,6 +2771,12 @@ async function saveTrip() {
   } catch(e) { toast('Save failed: '+e,'error'); }
 }
 
+async function toggleTripTable() {
+  const wrap = document.getElementById('trip-table-wrap');
+  wrap.classList.toggle('hidden');
+  if (!wrap.classList.contains('hidden')) await loadTripTable(1);
+}
+
 async function loadTripTable(page) {
   const wrap = document.getElementById('trip-table-wrap');
   const container = document.getElementById('trip-table-content');
@@ -2829,7 +2844,7 @@ async function renderDispatch() {
     <div class="section-card">
       <div class="section-title">
         <span>Dispatch – GC Entry (Multiple GCs per Truck Movement)</span>
-        <button class="btn btn-outline btn-sm" onclick="loadDispatchTable(1)">📋 View All GCs</button>
+        <button class="btn btn-outline btn-sm" onclick="toggleDispatchTable()">📋 View All GCs</button>
       </div>
 
       <div id="dp-info-panel" style="display:none;background:var(--primary-light);border:1px solid #bfdbfe;border-radius:8px;padding:10px 16px;margin-bottom:16px">
@@ -2912,16 +2927,8 @@ async function renderDispatch() {
           </div>
         </div>
         <div class="form-group">
-          <label>No. of Articles <span id="dp-articles-hint" style="color:var(--blue);font-size:10px;font-weight:400;text-transform:none">→ Auto Weight = Articles ÷ 40</span></label>
-          <input type="number" id="dp-articles" min="0" oninput="onArticlesInput()">
-        </div>
-        <div class="form-group">
-          <label>Weight (MT) for this GC * <span id="dp-mt-auto-badge" style="color:var(--green);font-size:10px;font-weight:600;text-transform:none;display:none">✓ Auto-calculated</span></label>
-          <input type="number" id="dp-final-mt" step="0.01" placeholder="Weight loaded under this GC" oninput="onFinalMTInput()">
-        </div>
-        <div class="form-group">
-          <label>Freight Amount (₹) for this GC</label>
-          <input type="number" id="dp-gc-freight" step="0.01" placeholder="Freight specific to this GC">
+          <label>No. of Articles</label>
+          <input type="number" id="dp-articles" min="0">
         </div>
       </div>
       <div class="form-actions">
@@ -2988,12 +2995,14 @@ async function loadDispGCList(soId) {
       <thead><tr><th>GC No</th><th>Consignor</th><th>Consignee</th><th class="text-right">Weight (MT)</th><th class="text-right">Freight (₹)</th><th>E-Way Bill</th><th>Actions</th></tr></thead>
       <tbody>${gcs.map(g=>`<tr>
         <td class="mono">${g.GC_No||'–'}</td><td>${g.Consignor||'–'}</td><td>${g.Consignee||'–'}</td>
-        <td class="mono text-right">${fmt(g.Weight_MT)}</td><td class="mono text-right">₹${fmt(g.Freight_Amount)}</td>
+        <td class="mono text-right">${parseFloat(g.Weight_MT)?fmt(g.Weight_MT):'<span style="color:var(--ink4)">set in MF</span>'}</td>
+        <td class="mono text-right">${parseFloat(g.Freight_Amount)?'₹'+fmt(g.Freight_Amount):'<span style="color:var(--ink4)">set in MF</span>'}</td>
         <td class="mono">${g.eway_bill_no||'–'}</td>
         <td><button class="btn btn-outline btn-sm" style="color:var(--red);border-color:#ffcecb" onclick="cancelGCRow(${g.GC_ID}, '${g.so_id}')">✕ Remove</button></td>
       </tr>`).join('')}</tbody>
       <tfoot><tr><td colspan="3" style="font-weight:700">TOTAL (${gcs.length} GC${gcs.length>1?'s':''})</td><td class="mono text-right" style="font-weight:700">${fmt(sumWeight)}</td><td class="mono text-right" style="font-weight:700">₹${fmt(sumFreight)}</td><td colspan="2"></td></tr></tfoot>
     </table></div>
+    <div style="font-size:11px;color:var(--ink3);margin-top:6px">Weight and Freight for each GC are entered in the MF Accounts module, not here.</div>
   `;
 }
 
@@ -3092,19 +3101,23 @@ async function saveDispatch() {
     Items: document.getElementById('dp-items').value,
     PKGS: document.getElementById('dp-pkgs-type').value,
     Articles: document.getElementById('dp-articles').value,
-    Weight_MT: document.getElementById('dp-final-mt').value,
-    Freight_Amount: document.getElementById('dp-gc-freight').value,
     Created_By: (auth.user?auth.user.username:'admin')
   };
   try {
     const r = await call('saveGCRow', data);
     if (r && r.success) {
-      toast('✅ GC added to truck movement!');
+      toast('✅ GC added to truck movement! Enter Weight & Freight for it in MF Accounts.');
       // Clear just the GC-specific fields so the next GC can be entered quickly
-      ['dp-gc','dp-invoice','dp-eway','dp-eway-expiry','dp-dest-gc','dp-items','dp-articles','dp-final-mt','dp-gc-freight'].forEach(id=>{ const el=document.getElementById(id); if (el) el.value=''; });
+      ['dp-gc','dp-invoice','dp-eway','dp-eway-expiry','dp-dest-gc','dp-items','dp-articles'].forEach(id=>{ const el=document.getElementById(id); if (el) el.value=''; });
       loadDispGCList(soId);
     }
   } catch(e) { toast('Save failed: '+e,'error'); }
+}
+
+async function toggleDispatchTable() {
+  const wrap = document.getElementById('dispatch-table-wrap');
+  wrap.classList.toggle('hidden');
+  if (!wrap.classList.contains('hidden')) await loadDispatchTable(1);
 }
 
 async function loadDispatchTable(page) {
@@ -3124,13 +3137,14 @@ async function loadDispatchTable(page) {
 async function renderMF() {
   await loadMasters();
   _mfGCRows = [];
+  _mfCurrentSOId = null;
   const sos = await call('getAllSOsForDropdown', {Converted:'YES', Allocated:'true', Documentation_Status:'true', MF_Status:'false'});
 
   setContent(`
     <div class="section-card">
       <div class="section-title">
         <span>MF Accounts Entry</span>
-        <button class="btn btn-outline btn-sm" onclick="loadMFTable(1)">📋 View Records</button>
+        <button class="btn btn-outline btn-sm" onclick="toggleMFTable()">📋 View Records</button>
       </div>
 
       <div id="mf-info-panel" style="display:none;background:var(--primary-light);border:1px solid #bfdbfe;border-radius:8px;padding:10px 16px;margin-bottom:16px">
@@ -3292,6 +3306,7 @@ async function onMFSOSelect() {
   if (!opt || !opt.value) return;
 
   const soId    = opt.value;
+  _mfCurrentSOId = soId;
   const partyId = opt.dataset.party || '';
   const fromId  = opt.dataset.from  || '';
   const toId    = opt.dataset.to    || '';
@@ -3322,19 +3337,8 @@ async function onMFSOSelect() {
     const gcContent = document.getElementById('mf-gc-content');
     if (_mfGCRows.length) {
       gcPanel.classList.remove('hidden');
-      const sumWeight  = _mfGCRows.reduce((s,g)=>s+(parseFloat(g.Weight_MT)||0),0);
-      const sumFreight = _mfGCRows.reduce((s,g)=>s+(parseFloat(g.Freight_Amount)||0),0);
-      gcContent.innerHTML = `
-        <div class="table-wrap"><table>
-          <thead><tr><th>GC No</th><th>Consignor</th><th>Consignee</th><th class="text-right">Weight (MT)</th><th class="text-right">Freight (₹)</th></tr></thead>
-          <tbody>${_mfGCRows.map(g=>`<tr><td class="mono">${g.GC_No||'–'}</td><td>${g.Consignor||'–'}</td><td>${g.Consignee||'–'}</td><td class="mono text-right">${fmt(g.Weight_MT)}</td><td class="mono text-right">₹${fmt(g.Freight_Amount)}</td></tr>`).join('')}</tbody>
-          <tfoot><tr><td colspan="3" style="font-weight:700">TOTAL (${_mfGCRows.length} GC${_mfGCRows.length>1?'s':''})</td><td class="mono text-right" style="font-weight:700">${fmt(sumWeight)}</td><td class="mono text-right" style="font-weight:700">₹${fmt(sumFreight)}</td></tr></tfoot>
-        </table></div>
-        <div style="font-size:11px;color:var(--ink3);margin-top:6px">Final MT and Total Freight below are auto-summed from these GCs. One MF, one Unloading, one Advice covers this entire truck movement.</div>
-      `;
-      document.getElementById('mf-final-mt').value = sumWeight.toFixed(3);
-      document.getElementById('mf-final-mt').readOnly = true;
-      document.getElementById('mf-total-freight').value = sumFreight.toFixed(2);
+      gcContent.innerHTML = renderMFGCTable();
+      recalcMFGCTotals();
     } else {
       gcPanel.classList.add('hidden');
       gcContent.innerHTML = '';
@@ -3357,12 +3361,58 @@ async function onMFSOSelect() {
 }
 
 let _mfGCRows = [];
+let _mfCurrentSOId = null;
+
+function renderMFGCTable() {
+  return `
+    <div class="table-wrap"><table>
+      <thead><tr><th>GC No</th><th>Consignor</th><th>Consignee</th><th style="width:140px">Weight (MT)</th><th style="width:160px">Freight (₹)</th><th></th></tr></thead>
+      <tbody>${_mfGCRows.map(g=>`<tr>
+        <td class="mono">${g.GC_No||'–'}</td><td>${g.Consignor||'–'}</td><td>${g.Consignee||'–'}</td>
+        <td><input type="number" step="0.01" id="mf-gc-w-${g.GC_ID}" value="${g.Weight_MT||0}" style="width:120px" oninput="recalcMFGCTotals()"></td>
+        <td><input type="number" step="0.01" id="mf-gc-f-${g.GC_ID}" value="${g.Freight_Amount||0}" style="width:140px" oninput="recalcMFGCTotals()"></td>
+        <td><button class="btn btn-outline btn-sm" onclick="saveMFGCAmounts(${g.GC_ID})">💾 Save</button></td>
+      </tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="3" style="font-weight:700">TOTAL (${_mfGCRows.length} GC${_mfGCRows.length>1?'s':''})</td><td id="mf-gc-total-w" class="mono" style="font-weight:700"></td><td id="mf-gc-total-f" class="mono" style="font-weight:700"></td><td></td></tr></tfoot>
+    </table></div>
+    <div style="font-size:11px;color:var(--ink3);margin-top:6px">Enter Weight (MT) and Freight Amount per GC, then click Save on that row. Final MT and Total Freight below update automatically from these GCs. One MF, one Unloading, one Advice covers this entire truck movement.</div>
+  `;
+}
+
+function recalcMFGCTotals() {
+  let sumW = 0, sumF = 0;
+  _mfGCRows.forEach(g => {
+    const w = parseFloat(document.getElementById('mf-gc-w-'+g.GC_ID)?.value) || 0;
+    const f = parseFloat(document.getElementById('mf-gc-f-'+g.GC_ID)?.value) || 0;
+    g._liveWeight = w; g._liveFreight = f;
+    sumW += w; sumF += f;
+  });
+  const wEl = document.getElementById('mf-gc-total-w'); if (wEl) wEl.textContent = fmt(sumW);
+  const fEl = document.getElementById('mf-gc-total-f'); if (fEl) fEl.textContent = '₹'+fmt(sumF);
+  document.getElementById('mf-final-mt').value = sumW.toFixed(3);
+  document.getElementById('mf-total-freight').value = sumF.toFixed(2);
+  calcMF();
+}
+
+async function saveMFGCAmounts(gcId) {
+  const w = document.getElementById('mf-gc-w-'+gcId)?.value || 0;
+  const f = document.getElementById('mf-gc-f-'+gcId)?.value || 0;
+  try {
+    const r = await call('updateGCAmounts', { GC_ID: gcId, Weight_MT: w, Freight_Amount: f, SO_ID: _mfCurrentSOId });
+    if (r && r.success) {
+      const row = _mfGCRows.find(g => String(g.GC_ID) === String(gcId));
+      if (row) { row.Weight_MT = w; row.Freight_Amount = f; }
+      toast('✅ GC amounts saved');
+      recalcMFGCTotals();
+    }
+  } catch(e) { toast('Save failed: '+e,'error'); }
+}
 
 function calcMF() {
   const v = id => parseFloat(document.getElementById(id)?.value)||0;
   const mt = v('mf-final-mt'), pmt = v('mf-pmt-rate');
   const usingGC = Array.isArray(_mfGCRows) && _mfGCRows.length > 0;
-  const totalFrt = usingGC ? _mfGCRows.reduce((s,g)=>s+(parseFloat(g.Freight_Amount)||0),0) : (mt * pmt);
+  const totalFrt = usingGC ? v('mf-total-freight') : (mt * pmt);
   const otherExp = v('mf-other-exp'), lm = v('mf-lm'), pm = v('mf-pm');
   const freightMF = totalFrt - lm - pm + otherExp;
   const diesel = v('mf-diesel'), other = v('mf-other'), balance = v('mf-balance');
@@ -3413,6 +3463,12 @@ async function saveMF() {
     const r = await call('saveMFData', data);
     if (r && r.success) { toast('✅ MF Account saved! MF No: ' + mfNo); renderMF(); }
   } catch(e) { toast('Save failed: '+e,'error'); }
+}
+
+async function toggleMFTable() {
+  const wrap = document.getElementById('mf-table-wrap');
+  wrap.classList.toggle('hidden');
+  if (!wrap.classList.contains('hidden')) await loadMFTable(1);
 }
 
 async function loadMFTable(page) {
