@@ -908,8 +908,10 @@ const auth = {
 const state = {
   page: 'dashboard',
   parties: [], places: [], brokers: [], cards: [],
+  grades: [], loadingClerks: [], loadingPoints: [],
   soPage: 1, tripPage: 1, dispPage: 1, mfPage: 1,
-  masterTab: 'party'
+  masterTab: 'party',
+  dispGCRows: [] // in-progress GC line items for the SO currently selected in Dispatch
 };
 
 // =============================================
@@ -1033,8 +1035,8 @@ function fmtNum(n) { return Number(n||0).toLocaleString('en-IN'); }
 // SUPABASE CONFIG — Replace with your project credentials
 // Get these from: supabase.com → Project → Settings → API
 // ═══════════════════════════════════════════════════════════
-const SUPABASE_URL  = 'https://jstonkfpqbcsdtdhmvkc.supabase.co';
-const SUPABASE_ANON = 'sb_publishable_Zkkt0zVf4Res7QJ3en0Iyg_4ezAi3Yl';
+const SUPABASE_URL  = 'https://mpngszrsbasepznlqavw.supabase.co';
+const SUPABASE_ANON = 'sb_publishable_0N0jYj5Im58NpVniqlQECA_dMCN2A3s';
 
 // ── Low-level Supabase REST helper ──────────────────────────
 async function sb(table, method, body, query) {
@@ -1109,6 +1111,69 @@ const SB = {
   },
   async saveBroker(d) {
     await sb('broker_master', 'POST', { broker_name: d.Broker_Name, primary_acc_no: d.Primary_Acc_No, ifsc: d.IFSC, secondary_acc_no: d.Secondary_Acc_No||'', secondary_ifsc: d.Secondary_IFSC||'', contact_no: d.Contact_No, status: d.Status || 'ACTIVE' });
+    return { success: true };
+  },
+
+  // ── GRADE / LOADING CLERK / LOADING POINT MASTERS ──
+  async getGradeMaster() {
+    const rows = await sb('grade_master', 'GET', null, '?order=grade_name.asc');
+    return rows.map(r => ({ ...r, Grade_ID: r.id, Grade_Name: r.grade_name, Status: r.status }));
+  },
+  async saveGrade(d) {
+    await sb('grade_master', 'POST', { grade_name: d.Grade_Name, status: d.Status || 'ACTIVE' });
+    return { success: true };
+  },
+  async getLoadingClerkMaster() {
+    const rows = await sb('loading_clerk_master', 'GET', null, '?order=clerk_name.asc');
+    return rows.map(r => ({ ...r, Clerk_ID: r.id, Clerk_Name: r.clerk_name, Status: r.status }));
+  },
+  async saveLoadingClerk(d) {
+    await sb('loading_clerk_master', 'POST', { clerk_name: d.Clerk_Name, status: d.Status || 'ACTIVE' });
+    return { success: true };
+  },
+  async getLoadingPointMaster() {
+    const rows = await sb('loading_point_master', 'GET', null, '?order=point_name.asc');
+    return rows.map(r => ({ ...r, Point_ID: r.id, Point_Name: r.point_name, Status: r.status }));
+  },
+  async saveLoadingPoint(d) {
+    await sb('loading_point_master', 'POST', { point_name: d.Point_Name, status: d.Status || 'ACTIVE' });
+    return { success: true };
+  },
+
+  // ── GC MASTER — multiple GCs per SO/MF/truck movement ──
+  async getGCsBySO(soId) {
+    const rows = await sb('gc_master', 'GET', null, '?so_id=eq.'+soId+'&cancelled=eq.false&order=id.asc');
+    return rows.map(r => ({ ...r, GC_ID: r.id, GC_No: r.gc_no, Consignor: r.consignor, Consignee: r.consignee, Weight_MT: r.weight_mt, Freight_Amount: r.freight_amount }));
+  },
+  async saveGCRow(d) {
+    const row = await sb('gc_master', 'POST', {
+      so_id: d.SO_ID, so_number: d.SO_Number, mf_no: d.MF_No || null,
+      gc_no: d.GC_No, consignor: d.Consignor, consignee: d.Consignee,
+      weight_mt: parseFloat(d.Weight_MT)||0, freight_amount: parseFloat(d.Freight_Amount)||0,
+      invoice_no: d.Invoice_No, eway_bill_no: d.Eway_Bill_No, eway_expiry: d.Eway_Expiry || null,
+      destination_gc: d.Destination_GC, items: d.Items, pkgs: d.PKGS, articles: d.Articles || null,
+      created_by: d.Created_By || (auth.user?auth.user.username:'admin')
+    });
+    // Recompute trip_dispatch_master aggregate (final_mt = sum of GC weights) + mark dispatched
+    const gcs = await sb('gc_master', 'GET', null, '?so_id=eq.'+d.SO_ID+'&cancelled=eq.false');
+    const totalMT = gcs.reduce((s,g)=>s+(parseFloat(g.weight_mt)||0),0);
+    const existing = await sb('trip_dispatch_master', 'GET', null, '?so_id=eq.'+d.SO_ID);
+    const tdUpdates = { final_mt: totalMT, dispatch_status: 'DISPATCHED', loading_date: d.Loading_Date || (existing[0]&&existing[0].loading_date) || null };
+    if (existing.length > 0) {
+      await sb('trip_dispatch_master', 'PATCH', tdUpdates, '?so_id=eq.'+d.SO_ID);
+    } else {
+      await sb('trip_dispatch_master', 'POST', { so_id: d.SO_ID, so_number: d.SO_Number, lorry_no: d.Lorry_No||'', trip_status: 'RUNNING', ...tdUpdates, created_by: d.Created_By||(auth.user?auth.user.username:'admin') });
+    }
+    await sb('so_master', 'PATCH', { documentation_status: true }, '?id=eq.' + d.SO_ID);
+    return { success: true, id: row[0]?.id };
+  },
+  async cancelGCRow(id) {
+    await sb('gc_master', 'PATCH', { cancelled: true }, '?id=eq.'+id);
+    return { success: true };
+  },
+  // Stamps the MF number onto every active GC belonging to this SO, once the MF is raised
+  async stampMFOnGCs(soId, mfNo) {
+    await sb('gc_master', 'PATCH', { mf_no: mfNo }, '?so_id=eq.'+soId+'&cancelled=eq.false');
     return { success: true };
   },
 
@@ -1257,13 +1322,15 @@ const SB = {
     const totalExp = ll+food+con+unl+xerox+det+ep+oc;
     const extraLabour = parseFloat(d.Extra_Labour)||0, totalCost = freightMF+totalExp+extraLabour;
     const billPmt = parseFloat(d.Bill_Pmt)||0, biltiFrt = billPmt*finalMT;
-    const payload = { mf_no: d.MF_No, so_id: d.SO_ID, so_number: d.SO_Number, lorry_no: d.Lorry_No, pmt_rate: pmtRate, final_mt: finalMT, total_freight: totalFreight, other_expense: otherExp, l_m: lm, p_m: pm, freight_mf: freightMF, advance: adv, diesel: diesel, diesel_paid: parseFloat(d.Diesel_Paid)||0, diesel_payment_type: d.Diesel_Payment_Type, diesel_ref: d.Diesel_Ref, diesel_card: d.Diesel_Card, other: other, balance: balance, loading_labour: ll, fooding: food, con: con, unloading: unl, xerox: xerox, detention: det, extra_point: ep, other_chrg: oc, total_exp: totalExp, extra_labour: extraLabour, total_cost: totalCost, bill_pmt: billPmt, bilti_freight: biltiFrt, created_by: d.Created_By||(auth.user?auth.user.username:'admin') };
+    const payload = { mf_no: d.MF_No, so_id: d.SO_ID, so_number: d.SO_Number, lorry_no: d.Lorry_No, pmt_rate: pmtRate, final_mt: finalMT, total_freight: totalFreight, other_expense: otherExp, l_m: lm, p_m: pm, freight_mf: freightMF, advance: adv, diesel: diesel, diesel_paid: parseFloat(d.Diesel_Paid)||0, diesel_payment_type: d.Diesel_Payment_Type, diesel_ref: d.Diesel_Ref, diesel_card: d.Diesel_Card, other: other, balance: balance, loading_labour: ll, fooding: food, con: con, unloading: unl, xerox: xerox, detention: det, extra_point: ep, other_chrg: oc, total_exp: totalExp, extra_labour: extraLabour, total_cost: totalCost, bill_pmt: billPmt, bilti_freight: biltiFrt, loading_clerk: d.Loading_Clerk||'', loading_point: d.Loading_Point||'', created_by: d.Created_By||(auth.user?auth.user.username:'admin') };
     if (d.Edit_ID) {
       await sb('mf_master', 'PATCH', payload, '?id=eq.' + d.Edit_ID);
     } else {
       await sb('mf_master', 'POST', payload);
     }
     await sb('so_master', 'PATCH', { mf_status: true }, '?id=eq.' + d.SO_ID);
+    // One MF per truck movement — stamp this MF No onto every GC under the SO
+    try { await sb('gc_master', 'PATCH', { mf_no: d.MF_No }, '?so_id=eq.'+d.SO_ID+'&cancelled=eq.false'); } catch(e) {}
     return { success: true };
   },
   async getMFData(page) {
@@ -1833,17 +1900,67 @@ async function loadMasters(force = false) {
     safe('getPartyMaster'),
     safe('getPlaceMaster'),
     safe('getBrokerMaster'),
-    safe('getCardMaster')
-  ]).then(([parties, places, brokers, cards]) => {
+    safe('getCardMaster'),
+    safe('getGradeMaster'),
+    safe('getLoadingClerkMaster'),
+    safe('getLoadingPointMaster')
+  ]).then(([parties, places, brokers, cards, grades, clerks, points]) => {
     state.parties = Array.isArray(parties) ? parties : [];
     state.places  = Array.isArray(places)  ? places  : [];
     state.brokers = Array.isArray(brokers) ? brokers : [];
     state.cards   = Array.isArray(cards)   ? cards   : [];
+    state.grades        = Array.isArray(grades) ? grades : [];
+    state.loadingClerks = Array.isArray(clerks) ? clerks : [];
+    state.loadingPoints = Array.isArray(points) ? points : [];
     _mastersLoaded  = true;
     _mastersLoading = null;
   }).catch(() => { _mastersLoading = null; });
 
   return _mastersLoading;
+}
+
+function gradeOpts(blank='-- Select Grade --') {
+  return `<option value="">${blank}</option>` +
+    state.grades.map(g => `<option value="${g.Grade_Name}">${g.Grade_Name}</option>`).join('');
+}
+function loadingClerkOpts(blank='-- Select Loading Clerk --') {
+  return `<option value="">${blank}</option>` +
+    state.loadingClerks.map(c => `<option value="${c.Clerk_Name}">${c.Clerk_Name}</option>`).join('');
+}
+function loadingPointOpts(blank='-- Select Loading Point --') {
+  return `<option value="">${blank}</option>` +
+    state.loadingPoints.map(p => `<option value="${p.Point_Name}">${p.Point_Name}</option>`).join('');
+}
+
+// Generic "add new value to a master + dropdown" helper, used by
+// Grade / Loading Clerk / Loading Point inline "+ Add" buttons.
+async function addInlineMasterValue(opts) {
+  // opts: {promptLabel, saveFn, fieldKey, selectId, reloadKey}
+  const name = prompt(opts.promptLabel);
+  if (!name || !name.trim()) return;
+  const trimmed = name.trim();
+  try {
+    const payload = {}; payload[opts.fieldKey] = trimmed;
+    const r = await call(opts.saveFn, payload);
+    if (r && r.success) {
+      await loadMasters(true);
+      const sel = document.getElementById(opts.selectId);
+      if (sel) {
+        sel.innerHTML = opts.optsFn();
+        setSelectByText(opts.selectId, trimmed);
+      }
+      toast('Added: ' + trimmed);
+    }
+  } catch(e) { toast('Failed: '+e,'error'); }
+}
+function addGradeInline() {
+  addInlineMasterValue({promptLabel:'Enter new Grade (e.g. A / B / C):', saveFn:'saveGrade', fieldKey:'Grade_Name', selectId:'op-grade', optsFn:gradeOpts});
+}
+function addLoadingClerkInline() {
+  addInlineMasterValue({promptLabel:'Enter new Loading Clerk name:', saveFn:'saveLoadingClerk', fieldKey:'Clerk_Name', selectId:'mf-loading-clerk', optsFn:loadingClerkOpts});
+}
+function addLoadingPointInline() {
+  addInlineMasterValue({promptLabel:'Enter new Loading Point name:', saveFn:'saveLoadingPoint', fieldKey:'Point_Name', selectId:'mf-loading-point', optsFn:loadingPointOpts});
 }
 
 function partyOpts(includeBlank=true) {
@@ -2547,7 +2664,10 @@ async function renderOperations() {
         </div>
         <div class="form-group">
           <label>Grade</label>
-          <input type="text" id="op-grade" placeholder="e.g. A / B / C">
+          <div style="display:flex;gap:6px">
+            <select id="op-grade" style="flex:1">${gradeOpts()}</select>
+            <button class="btn btn-outline btn-sm" onclick="addGradeInline()" title="Add new grade" style="padding:5px 10px;white-space:nowrap">+ Add</button>
+          </div>
         </div>
       </div>
       <div class="form-actions">
@@ -2703,13 +2823,13 @@ function cancelTripRow(id) { cancelGenericRecord('trip_dispatch_master', id, ()=
 // =============================================
 async function renderDispatch() {
   await loadMasters();
-  const sos = await call('getAllSOsForDropdown', {Converted:'YES', Allocated:'true', Documentation_Status:'false'});
+  const sos = await call('getAllSOsForDropdown', {Converted:'YES', Allocated:'true'});
 
   setContent(`
     <div class="section-card">
       <div class="section-title">
-        <span>Dispatch – Documentation</span>
-        <button class="btn btn-outline btn-sm" onclick="loadDispatchTable(1)">📋 View Records</button>
+        <span>Dispatch – GC Entry (Multiple GCs per Truck Movement)</span>
+        <button class="btn btn-outline btn-sm" onclick="loadDispatchTable(1)">📋 View All GCs</button>
       </div>
 
       <div id="dp-info-panel" style="display:none;background:var(--primary-light);border:1px solid #bfdbfe;border-radius:8px;padding:10px 16px;margin-bottom:16px">
@@ -2718,13 +2838,13 @@ async function renderDispatch() {
           <div><span style="color:var(--ink3);font-weight:600;display:block;font-size:10px;text-transform:uppercase">From</span><span id="dp-info-from" style="font-weight:700">–</span></div>
           <div><span style="color:var(--ink3);font-weight:600;display:block;font-size:10px;text-transform:uppercase">To</span><span id="dp-info-to" style="font-weight:700">–</span></div>
           <div><span style="color:var(--ink3);font-weight:600;display:block;font-size:10px;text-transform:uppercase">MT (SO)</span><span id="dp-info-mt" style="font-weight:700">–</span></div>
-          <div><span style="color:var(--ink3);font-weight:600;display:block;font-size:10px;text-transform:uppercase">Consignor</span><span id="dp-info-consignor" style="font-weight:700">–</span></div>
+          <div><span style="color:var(--ink3);font-weight:600;display:block;font-size:10px;text-transform:uppercase">Lorry No</span><span id="dp-info-consignor" style="font-weight:700">–</span></div>
         </div>
       </div>
 
       <div class="form-grid">
         <div class="form-group">
-          <label>Select SO Number *</label>
+          <label>Select SO Number * <span style="color:var(--ink3);font-size:10px;text-transform:none">(one SO = one truck = one MF; add as many GCs below as this truck is carrying)</span></label>
           <select id="dp-so" onchange="onDispatchSOSelect()">
             <option value="">-- Select SO --</option>
             ${sos.map(s=>`<option value="${s.SO_ID}"
@@ -2741,12 +2861,24 @@ async function renderDispatch() {
           <input type="text" id="dp-lorry" class="calc-field" readonly placeholder="Auto-filled from Operations">
         </div>
         <div class="form-group">
-          <label>Loading Date *</label>
+          <label>Loading Date * <span style="color:var(--ink3);font-size:10px;text-transform:none">(common for whole truck)</span></label>
           <input type="date" id="dp-loading-date">
         </div>
+      </div>
+
+      <div class="form-divider">Add a GC to this Truck Movement</div>
+      <div class="form-grid">
         <div class="form-group">
-          <label>GC No</label>
+          <label>GC No *</label>
           <input type="text" id="dp-gc" placeholder="Goods Consignment No">
+        </div>
+        <div class="form-group">
+          <label>Consignor (Party – From) *</label>
+          <select id="dp-consignor"><option value="">-- Select Consignor --</option>${state.parties.map(p=>`<option value="${p.Party_Name}">${p.Party_Name}</option>`).join('')}</select>
+        </div>
+        <div class="form-group">
+          <label>Consignee (Party – To) *</label>
+          <select id="dp-consignee"><option value="">-- Select Consignee --</option>${state.parties.map(p=>`<option value="${p.Party_Name}">${p.Party_Name}</option>`).join('')}</select>
         </div>
         <div class="form-group">
           <label>Invoice No</label>
@@ -2780,21 +2912,31 @@ async function renderDispatch() {
           </div>
         </div>
         <div class="form-group">
-          <label>No. of Articles <span id="dp-articles-hint" style="color:var(--blue);font-size:10px;font-weight:400;text-transform:none">→ Auto MT = Articles ÷ 40</span></label>
+          <label>No. of Articles <span id="dp-articles-hint" style="color:var(--blue);font-size:10px;font-weight:400;text-transform:none">→ Auto Weight = Articles ÷ 40</span></label>
           <input type="number" id="dp-articles" min="0" oninput="onArticlesInput()">
         </div>
         <div class="form-group">
-          <label>Final MT * <span id="dp-mt-auto-badge" style="color:var(--green);font-size:10px;font-weight:600;text-transform:none;display:none">✓ Auto-calculated</span></label>
-          <input type="number" id="dp-final-mt" step="0.01" placeholder="Actual loaded MT" oninput="onFinalMTInput()">
+          <label>Weight (MT) for this GC * <span id="dp-mt-auto-badge" style="color:var(--green);font-size:10px;font-weight:600;text-transform:none;display:none">✓ Auto-calculated</span></label>
+          <input type="number" id="dp-final-mt" step="0.01" placeholder="Weight loaded under this GC" oninput="onFinalMTInput()">
+        </div>
+        <div class="form-group">
+          <label>Freight Amount (₹) for this GC</label>
+          <input type="number" id="dp-gc-freight" step="0.01" placeholder="Freight specific to this GC">
         </div>
       </div>
       <div class="form-actions">
         <button class="btn btn-outline" onclick="renderDispatch()">↺ Reset</button>
-        <button class="btn btn-primary" onclick="saveDispatch()">💾 Save Dispatch</button>
+        <button class="btn btn-primary" onclick="saveDispatch()">+ Add GC to Truck</button>
       </div>
     </div>
+
+    <div id="dp-gc-list-wrap" class="hidden section-card">
+      <div class="section-title">GCs Added to This Truck Movement (Single MF / Unloading / Advice will cover all of these)</div>
+      <div id="dp-gc-list-content"></div>
+    </div>
+
     <div id="dispatch-table-wrap" class="hidden section-card">
-      <div class="section-title">Dispatch Records</div>
+      <div class="section-title">All GC Records</div>
       <div id="dispatch-table-content"></div>
     </div>
   `);
@@ -2824,11 +2966,44 @@ async function onDispatchSOSelect() {
     const details = await call('getSODetails', soId);
     const trip = details && details.trip;
     document.getElementById('dp-lorry').value = trip ? (trip.Lorry_No || '') : '';
-    document.getElementById('dp-info-consignor').textContent = trip ? (trip.Consignor || '–') : '–';
-    if (mt) document.getElementById('dp-final-mt').value = mt;
+    document.getElementById('dp-info-consignor').textContent = trip ? (trip.Lorry_No || '–') : '–';
+    setSelectByText('dp-consignor', trip ? (trip.Consignor||'') : '');
+    setSelectByText('dp-consignee', trip ? (trip.Consignee||'') : '');
   } catch(e) {
     document.getElementById('dp-lorry').value = '';
   }
+  loadDispGCList(soId);
+}
+
+async function loadDispGCList(soId) {
+  const wrap = document.getElementById('dp-gc-list-wrap');
+  const content = document.getElementById('dp-gc-list-content');
+  const gcs = await call('getGCsBySO', soId);
+  if (!gcs || !gcs.length) { wrap.classList.add('hidden'); content.innerHTML=''; return; }
+  wrap.classList.remove('hidden');
+  const sumWeight  = gcs.reduce((s,g)=>s+(parseFloat(g.Weight_MT)||0),0);
+  const sumFreight = gcs.reduce((s,g)=>s+(parseFloat(g.Freight_Amount)||0),0);
+  content.innerHTML = `
+    <div class="table-wrap"><table>
+      <thead><tr><th>GC No</th><th>Consignor</th><th>Consignee</th><th class="text-right">Weight (MT)</th><th class="text-right">Freight (₹)</th><th>E-Way Bill</th><th>Actions</th></tr></thead>
+      <tbody>${gcs.map(g=>`<tr>
+        <td class="mono">${g.GC_No||'–'}</td><td>${g.Consignor||'–'}</td><td>${g.Consignee||'–'}</td>
+        <td class="mono text-right">${fmt(g.Weight_MT)}</td><td class="mono text-right">₹${fmt(g.Freight_Amount)}</td>
+        <td class="mono">${g.eway_bill_no||'–'}</td>
+        <td><button class="btn btn-outline btn-sm" style="color:var(--red);border-color:#ffcecb" onclick="cancelGCRow(${g.GC_ID}, '${g.so_id}')">✕ Remove</button></td>
+      </tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="3" style="font-weight:700">TOTAL (${gcs.length} GC${gcs.length>1?'s':''})</td><td class="mono text-right" style="font-weight:700">${fmt(sumWeight)}</td><td class="mono text-right" style="font-weight:700">₹${fmt(sumFreight)}</td><td colspan="2"></td></tr></tfoot>
+    </table></div>
+  `;
+}
+
+async function cancelGCRow(gcId, soId) {
+  if (!confirm('Remove this GC from the truck movement?')) return;
+  try {
+    await call('cancelGCRow', gcId);
+    toast('GC removed');
+    loadDispGCList(soId);
+  } catch(e) { toast('Failed: '+e,'error'); }
 }
 
 // Custom PKGS types stored in session
@@ -2899,11 +3074,17 @@ async function saveDispatch() {
   const soId  = soSel.value;
   const soNum = soSel.options[soSel.selectedIndex]?.dataset?.num;
   if (!soId) { toast('Select an SO', 'error'); return; }
+  const gcNo = document.getElementById('dp-gc').value.trim();
+  if (!gcNo) { toast('GC No is required', 'error'); return; }
+  const consignor = document.getElementById('dp-consignor').value;
+  const consignee = document.getElementById('dp-consignee').value;
+  if (!consignor || !consignee) { toast('Select Consignor and Consignee for this GC', 'error'); return; }
   const data = {
     SO_ID: soId, SO_Number: soNum,
     Lorry_No: document.getElementById('dp-lorry').value,
     Loading_Date: document.getElementById('dp-loading-date').value,
-    GC_No: document.getElementById('dp-gc').value,
+    GC_No: gcNo,
+    Consignor: consignor, Consignee: consignee,
     Invoice_No: document.getElementById('dp-invoice').value,
     Eway_Bill_No: document.getElementById('dp-eway').value,
     Eway_Expiry: document.getElementById('dp-eway-expiry').value,
@@ -2911,12 +3092,18 @@ async function saveDispatch() {
     Items: document.getElementById('dp-items').value,
     PKGS: document.getElementById('dp-pkgs-type').value,
     Articles: document.getElementById('dp-articles').value,
-    Final_MT: document.getElementById('dp-final-mt').value,
+    Weight_MT: document.getElementById('dp-final-mt').value,
+    Freight_Amount: document.getElementById('dp-gc-freight').value,
     Created_By: (auth.user?auth.user.username:'admin')
   };
   try {
-    const r = await call('saveDispatchData', data);
-    if (r && r.success) { toast('✅ Dispatch saved! Documentation status updated.'); renderDispatch(); }
+    const r = await call('saveGCRow', data);
+    if (r && r.success) {
+      toast('✅ GC added to truck movement!');
+      // Clear just the GC-specific fields so the next GC can be entered quickly
+      ['dp-gc','dp-invoice','dp-eway','dp-eway-expiry','dp-dest-gc','dp-items','dp-articles','dp-final-mt','dp-gc-freight'].forEach(id=>{ const el=document.getElementById(id); if (el) el.value=''; });
+      loadDispGCList(soId);
+    }
   } catch(e) { toast('Save failed: '+e,'error'); }
 }
 
@@ -2928,7 +3115,7 @@ async function loadDispatchTable(page) {
   const result = await call('getDispatchData', page);
   const {data, total} = result || {data:[], total:0};
   const rows = (data||[]).map(r => `<tr><td class="mono">${r.SO_Number}</td><td>${r.Lorry_No}</td><td>${r.GC_No||'–'}</td><td>${r.Eway_Bill_No||'–'}</td><td>${r.Final_MT}</td><td><button class="btn btn-outline btn-sm" onclick="editTripRow(${r.id})">✎ Edit</button> ${r.trip_status==='CANCELLED'?`<button class="btn btn-outline btn-sm" onclick="uncancelGenericRecord('trip_dispatch_master', ${r.id}, ()=>loadDispatchTable(1))">↺ Restore</button>`:`<button class="btn btn-outline btn-sm" style="color:var(--red);border-color:#ffcecb" onclick="cancelGenericRecord('trip_dispatch_master', ${r.id}, ()=>loadDispatchTable(1))">✕ Cancel</button>`}</td></tr>`).join('');
-  container.innerHTML = `<div class="table-wrap"><table><thead><tr><th>SO No</th><th>Lorry</th><th>GC No</th><th>E-Way Bill</th><th>Final MT</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="loading">No records</td></tr>'}</tbody></table></div>${renderPagination(page, Math.ceil(total/50), 'loadDispatchTable')}`;
+  container.innerHTML = `<div class="table-wrap"><table><thead><tr><th>SO No</th><th>Lorry</th><th>GC No(s)</th><th>E-Way Bill</th><th>Final MT (Sum of GCs)</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="loading">No records</td></tr>'}</tbody></table></div>${renderPagination(page, Math.ceil(total/50), 'loadDispatchTable')}`;
 }
 
 // =============================================
@@ -2936,6 +3123,7 @@ async function loadDispatchTable(page) {
 // =============================================
 async function renderMF() {
   await loadMasters();
+  _mfGCRows = [];
   const sos = await call('getAllSOsForDropdown', {Converted:'YES', Allocated:'true', Documentation_Status:'true', MF_Status:'false'});
 
   setContent(`
@@ -2953,6 +3141,11 @@ async function renderMF() {
           <div><span style="color:var(--ink3);font-weight:600;display:block;font-size:10px;text-transform:uppercase">GC No</span><span id="mf-info-gc" style="font-weight:700">–</span></div>
           <div><span style="color:var(--ink3);font-weight:600;display:block;font-size:10px;text-transform:uppercase">E-Way Expiry</span><span id="mf-info-eway" style="font-weight:700">–</span></div>
         </div>
+      </div>
+
+      <div id="mf-gc-panel" class="hidden section-card" style="margin-bottom:16px;background:#fafafa">
+        <div class="section-title" style="font-size:12px">GCs in this Truck Movement (Auto, from Dispatch)</div>
+        <div id="mf-gc-content"></div>
       </div>
 
       <div class="form-grid">
@@ -3043,6 +3236,20 @@ async function renderMF() {
           <label>Balance *</label>
           <input type="number" id="mf-balance" value="0" oninput="calcMF()">
         </div>
+        <div class="form-group">
+          <label>Loading Clerk</label>
+          <div style="display:flex;gap:6px">
+            <select id="mf-loading-clerk" style="flex:1">${loadingClerkOpts()}</select>
+            <button class="btn btn-outline btn-sm" onclick="addLoadingClerkInline()" title="Add new loading clerk" style="padding:5px 10px;white-space:nowrap">+ Add</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Loading Point</label>
+          <div style="display:flex;gap:6px">
+            <select id="mf-loading-point" style="flex:1">${loadingPointOpts()}</select>
+            <button class="btn btn-outline btn-sm" onclick="addLoadingPointInline()" title="Add new loading point" style="padding:5px 10px;white-space:nowrap">+ Add</button>
+          </div>
+        </div>
         <div class="form-divider">Expense Details</div>
         <div class="form-group"><label>Loading Labour</label><input type="number" id="mf-ll" value="0" oninput="calcMF()"></div>
         <div class="form-group"><label>Fooding</label><input type="number" id="mf-food" value="0" oninput="calcMF()"></div>
@@ -3108,13 +3315,38 @@ async function onMFSOSelect() {
     document.getElementById('mf-lorry').value            = lorry;
     document.getElementById('mf-info-lorry').textContent = lorry || '–';
 
-    const finalMT = disp ? (disp.Final_MT || '') : '';
-    document.getElementById('mf-final-mt').value = finalMT;
+    // Multi-GC: pull every GC under this SO/truck movement
+    const gcs = await call('getGCsBySO', soId);
+    _mfGCRows = Array.isArray(gcs) ? gcs : [];
+    const gcPanel = document.getElementById('mf-gc-panel');
+    const gcContent = document.getElementById('mf-gc-content');
+    if (_mfGCRows.length) {
+      gcPanel.classList.remove('hidden');
+      const sumWeight  = _mfGCRows.reduce((s,g)=>s+(parseFloat(g.Weight_MT)||0),0);
+      const sumFreight = _mfGCRows.reduce((s,g)=>s+(parseFloat(g.Freight_Amount)||0),0);
+      gcContent.innerHTML = `
+        <div class="table-wrap"><table>
+          <thead><tr><th>GC No</th><th>Consignor</th><th>Consignee</th><th class="text-right">Weight (MT)</th><th class="text-right">Freight (₹)</th></tr></thead>
+          <tbody>${_mfGCRows.map(g=>`<tr><td class="mono">${g.GC_No||'–'}</td><td>${g.Consignor||'–'}</td><td>${g.Consignee||'–'}</td><td class="mono text-right">${fmt(g.Weight_MT)}</td><td class="mono text-right">₹${fmt(g.Freight_Amount)}</td></tr>`).join('')}</tbody>
+          <tfoot><tr><td colspan="3" style="font-weight:700">TOTAL (${_mfGCRows.length} GC${_mfGCRows.length>1?'s':''})</td><td class="mono text-right" style="font-weight:700">${fmt(sumWeight)}</td><td class="mono text-right" style="font-weight:700">₹${fmt(sumFreight)}</td></tr></tfoot>
+        </table></div>
+        <div style="font-size:11px;color:var(--ink3);margin-top:6px">Final MT and Total Freight below are auto-summed from these GCs. One MF, one Unloading, one Advice covers this entire truck movement.</div>
+      `;
+      document.getElementById('mf-final-mt').value = sumWeight.toFixed(3);
+      document.getElementById('mf-final-mt').readOnly = true;
+      document.getElementById('mf-total-freight').value = sumFreight.toFixed(2);
+    } else {
+      gcPanel.classList.add('hidden');
+      gcContent.innerHTML = '';
+      document.getElementById('mf-final-mt').readOnly = false;
+      const finalMT = disp ? (disp.Final_MT || '') : '';
+      document.getElementById('mf-final-mt').value = finalMT;
+    }
 
-    document.getElementById('mf-info-gc').textContent   = disp ? (disp.GC_No || '–')                  : '–';
+    document.getElementById('mf-info-gc').textContent   = _mfGCRows.length ? _mfGCRows.map(g=>g.GC_No).filter(Boolean).join(', ') : (disp ? (disp.GC_No || '–') : '–');
     document.getElementById('mf-info-eway').textContent = disp ? fmtDate(disp.Eway_Expiry)             : '–';
 
-    if (finalMT) calcMF();
+    calcMF();
   } catch(e) {
     document.getElementById('mf-lorry').value = '';
     document.getElementById('mf-info-lorry').textContent = '–';
@@ -3124,10 +3356,13 @@ async function onMFSOSelect() {
   }
 }
 
+let _mfGCRows = [];
+
 function calcMF() {
   const v = id => parseFloat(document.getElementById(id)?.value)||0;
   const mt = v('mf-final-mt'), pmt = v('mf-pmt-rate');
-  const totalFrt = mt * pmt;
+  const usingGC = Array.isArray(_mfGCRows) && _mfGCRows.length > 0;
+  const totalFrt = usingGC ? _mfGCRows.reduce((s,g)=>s+(parseFloat(g.Freight_Amount)||0),0) : (mt * pmt);
   const otherExp = v('mf-other-exp'), lm = v('mf-lm'), pm = v('mf-pm');
   const freightMF = totalFrt - lm - pm + otherExp;
   const diesel = v('mf-diesel'), other = v('mf-other'), balance = v('mf-balance');
@@ -3171,6 +3406,7 @@ async function saveMF() {
     Unloading:v('mf-unload'), Xerox:v('mf-xerox'), Detention:v('mf-detention'),
     Extra_Point:v('mf-extra-pt'), Other_Chrg:v('mf-other-chrg'),
     Extra_Labour:v('mf-extra-labour'), Bill_Pmt:v('mf-bill-pmt'),
+    Loading_Clerk:v('mf-loading-clerk'), Loading_Point:v('mf-loading-point'),
     Created_By:(auth.user?auth.user.username:'admin')
   };
   try {
@@ -3983,6 +4219,9 @@ async function renderMasters() {
         <div class="tab active" onclick="switchMasterTab('party',this)">Party Master</div>
         <div class="tab" onclick="switchMasterTab('place',this)">Place Master</div>
         <div class="tab" onclick="switchMasterTab('broker',this)">Broker Master</div>
+        <div class="tab" onclick="switchMasterTab('grade',this)">Grade Master</div>
+        <div class="tab" onclick="switchMasterTab('clerk',this)">Loading Clerk Master</div>
+        <div class="tab" onclick="switchMasterTab('point',this)">Loading Point Master</div>
       </div>
       <div id="master-content"></div>
     </div>
@@ -4070,7 +4309,74 @@ function renderMasterTab(tab, page) {
       <div class="table-wrap mt-8"><table><thead><tr><th>ID</th><th>Name</th><th>Contact</th><th>Acc No</th><th>IFSC</th><th>Status</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="loading">No records</td></tr>'}</tbody></table></div>
       ${pager}
     `;
+  } else if (tab==='grade') {
+    const { items, pager, countInfo } = paginate(state.grades, 'grade');
+    const rows = items.map(g => `<tr><td>${g.Grade_ID}</td><td>${g.Grade_Name}</td><td><span class="badge b-yes">${g.Status}</span></td></tr>`).join('');
+    container.innerHTML = `
+      <div class="form-grid-2" style="margin-bottom:14px">
+        <div class="form-group"><label>Grade Name *</label><input type="text" id="m-grade-name" placeholder="e.g. A / B / C"></div>
+      </div>
+      <div class="form-actions" style="margin-top:0;border-top:none">
+        <button class="btn btn-primary btn-sm" onclick="addGrade()">+ Add Grade</button>
+      </div>
+      ${countInfo}
+      <div class="table-wrap mt-8"><table><thead><tr><th>ID</th><th>Grade</th><th>Status</th></tr></thead><tbody>${rows||'<tr><td colspan="3" class="loading">No records</td></tr>'}</tbody></table></div>
+      ${pager}
+    `;
+  } else if (tab==='clerk') {
+    const { items, pager, countInfo } = paginate(state.loadingClerks, 'clerk');
+    const rows = items.map(c => `<tr><td>${c.Clerk_ID}</td><td>${c.Clerk_Name}</td><td><span class="badge b-yes">${c.Status}</span></td></tr>`).join('');
+    container.innerHTML = `
+      <div class="form-grid-2" style="margin-bottom:14px">
+        <div class="form-group"><label>Loading Clerk Name *</label><input type="text" id="m-clerk-name"></div>
+      </div>
+      <div class="form-actions" style="margin-top:0;border-top:none">
+        <button class="btn btn-primary btn-sm" onclick="addLoadingClerkMaster()">+ Add Loading Clerk</button>
+      </div>
+      ${countInfo}
+      <div class="table-wrap mt-8"><table><thead><tr><th>ID</th><th>Clerk Name</th><th>Status</th></tr></thead><tbody>${rows||'<tr><td colspan="3" class="loading">No records</td></tr>'}</tbody></table></div>
+      ${pager}
+    `;
+  } else if (tab==='point') {
+    const { items, pager, countInfo } = paginate(state.loadingPoints, 'point');
+    const rows = items.map(p => `<tr><td>${p.Point_ID}</td><td>${p.Point_Name}</td><td><span class="badge b-yes">${p.Status}</span></td></tr>`).join('');
+    container.innerHTML = `
+      <div class="form-grid-2" style="margin-bottom:14px">
+        <div class="form-group"><label>Loading Point Name *</label><input type="text" id="m-point-name"></div>
+      </div>
+      <div class="form-actions" style="margin-top:0;border-top:none">
+        <button class="btn btn-primary btn-sm" onclick="addLoadingPointMaster()">+ Add Loading Point</button>
+      </div>
+      ${countInfo}
+      <div class="table-wrap mt-8"><table><thead><tr><th>ID</th><th>Point Name</th><th>Status</th></tr></thead><tbody>${rows||'<tr><td colspan="3" class="loading">No records</td></tr>'}</tbody></table></div>
+      ${pager}
+    `;
   }
+}
+
+async function addGrade() {
+  const name = document.getElementById('m-grade-name').value.trim();
+  if (!name) { toast('Grade name required','error'); return; }
+  try {
+    const r = await call('saveGrade', {Grade_Name:name});
+    if (r.success) { toast('Grade added!'); await loadMasters(true); _masterPage['grade'] = 1; renderMasterTab('grade'); }
+  } catch(e) { toast('Failed: '+e,'error'); }
+}
+async function addLoadingClerkMaster() {
+  const name = document.getElementById('m-clerk-name').value.trim();
+  if (!name) { toast('Loading Clerk name required','error'); return; }
+  try {
+    const r = await call('saveLoadingClerk', {Clerk_Name:name});
+    if (r.success) { toast('Loading Clerk added!'); await loadMasters(true); _masterPage['clerk'] = 1; renderMasterTab('clerk'); }
+  } catch(e) { toast('Failed: '+e,'error'); }
+}
+async function addLoadingPointMaster() {
+  const name = document.getElementById('m-point-name').value.trim();
+  if (!name) { toast('Loading Point name required','error'); return; }
+  try {
+    const r = await call('saveLoadingPoint', {Point_Name:name});
+    if (r.success) { toast('Loading Point added!'); await loadMasters(true); _masterPage['point'] = 1; renderMasterTab('point'); }
+  } catch(e) { toast('Failed: '+e,'error'); }
 }
 
 async function addParty() {
@@ -5935,7 +6241,7 @@ async function renderMonthlyPL() {
       <div class="section-title">
         <span>Monthly P&L Summary</span>
         <select id="pl-year" onchange="loadMonthlyPL()" style="padding:5px 10px;border:1px solid var(--border);border-radius:4px;font-size:12px;font-weight:600">
-          ${[curYear, curYear-1, curYear-2].map(y=>`<option value="${y}"${y===curYear?' selected':''}>${y}</option>`).join('')}
+          ${[curYear, curYear+1, curYear+2].map(y=>`<option value="${y}"${y===curYear?' selected':''}>${y}</option>`).join('')}
           <option value="">All Years</option>
         </select>
       </div>
